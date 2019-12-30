@@ -27,6 +27,7 @@
 
 #pragma once
 
+#include <stdlib.h>
 #include <functional>
 #include <shared_mutex>
 #include <thread>
@@ -40,6 +41,8 @@
 #include "utils/logging.h"
 #include "utils/mutex.h"
 #include "utils/optional.h"
+#include <iostream>
+#include <fstream>
 
 namespace lczero {
 
@@ -106,6 +109,9 @@ class Search {
   EdgeAndNode GetBestChildNoTemperature(Node* parent) const;
   std::vector<EdgeAndNode> GetBestChildrenNoTemperature(Node* parent,
                                                         int count) const;
+
+  EdgeAndNode GetBestChildrenExpectation(Node* parent,bool toPrint = false) const;
+
   EdgeAndNode GetBestChildWithTemperature(Node* parent,
                                           float temperature) const;
 
@@ -251,6 +257,7 @@ class SearchWorker {
   struct NodeToProcess {
     bool IsExtendable() const { return !is_collision && !node->IsTerminal(); }
     bool IsCollision() const { return is_collision; }
+    bool IsRedundent() const { return is_redundent; }
     bool CanEvalOutOfOrder() const {
       return is_cache_hit || node->IsTerminal();
     }
@@ -266,24 +273,33 @@ class SearchWorker {
     bool nn_queried = false;
     bool is_cache_hit = false;
     bool is_collision = false;
+    bool is_redundent = false;
 
-    static NodeToProcess Collision(Node* node, uint16_t depth,
-                                   int collision_count) {
+        static NodeToProcess
+        Collision(Node* node, uint16_t depth, int collision_count) {
       return NodeToProcess(node, depth, true, collision_count);
     }
     static NodeToProcess Visit(Node* node, uint16_t depth) {
       return NodeToProcess(node, depth, false, 1);
     }
 
+	static NodeToProcess Redundent() {
+      return NodeToProcess();
+    }
+
    private:
-    NodeToProcess(Node* node, uint16_t depth, bool is_collision, int multivisit)
-        : node(node),
-          multivisit(multivisit),
-          depth(depth),
-          is_collision(is_collision) {}
+        NodeToProcess(Node* node, uint16_t depth, bool is_collision,
+                      int multivisit)
+            : node(node),
+              multivisit(multivisit),
+              depth(depth),
+              is_collision(is_collision){};
+
+    NodeToProcess() : is_redundent(true){};
   };
 
   NodeToProcess PickNodeToExtend(int collision_limit);
+  NodeToProcess PickNodeToExtend(int collision_limit, bool isAlpha);
   void ExtendNode(Node* node);
   bool AddNodeToComputation(Node* node, bool add_if_cached);
   int PrefetchIntoCache(Node* node, int budget);

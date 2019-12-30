@@ -184,7 +184,7 @@ Node* Node::CreateSingleChildNode(Move move) {
   assert(!edges_);
   assert(!child_);
   edges_ = EdgeList({move});
-  child_ = std::make_unique<Node>(this, 0);
+  child_ = std::make_unique<Node>(this, 0, depth_ + 1);
   return child_.get();
 }
 
@@ -194,8 +194,10 @@ void Node::CreateEdges(const MoveList& moves) {
   edges_ = EdgeList(moves);
 }
 
-Node::ConstIterator Node::Edges() const { return {edges_, &child_}; }
-Node::Iterator Node::Edges() { return {edges_, &child_}; }
+Node::ConstIterator Node::Edges() const {
+  return {edges_, &child_, depth_ + 1};
+}
+Node::Iterator Node::Edges() { return {edges_, &child_, depth_ + 1}; }
 
 float Node::GetVisitedPolicy() const { return visited_policy_; }
 
@@ -227,6 +229,23 @@ void Node::MakeTerminal(GameResult result) {
   } else if (result == GameResult::BLACK_WON) {
     q_ = -1.0f;
     d_ = 0.0f;
+  }
+  discretizationCDF.clear();
+  discretizationCDF.push_back(std::make_pair(q_, 1.0));
+}
+
+void Node::UpdateNodeCDF() {
+  discretizationCDF.resize(0);
+  bool isNonExpendedChild = false;
+  for (const auto& child : Edges()) {
+    if (child.node() && child.node()->discretizationCDF.size() > 0) {
+      addCDF(child.node()->discretizationCDF, true);
+    } else {
+      isNonExpendedChild = true;
+    }
+  }
+  if (isNonExpendedChild) {
+    addCDF(originalDiscretizationCDF, false);
   }
 }
 
@@ -264,7 +283,7 @@ void Node::CancelScoreUpdate(int multivisit) {
   best_child_cached_ = nullptr;
 }
 
-void Node::FinalizeScoreUpdate(float v, float d, int multivisit) {
+void Node::FinalizeScoreUpdate(float v, float d, int multivisit, bool flipped) {
   // Recompute Q.
   q_ += multivisit * (v - q_) / (n_ + multivisit);
   d_ += multivisit * (d - d_) / (n_ + multivisit);
@@ -273,6 +292,48 @@ void Node::FinalizeScoreUpdate(float v, float d, int multivisit) {
   if (n_ == 0 && parent_ != nullptr) {
     parent_->visited_policy_ += parent_->edges_[index_].GetP();
   }
+
+  if (n_ == 0) {
+    if (IsTerminal()) {
+      discretizationCDF.clear();
+      discretizationCDF.push_back(std::make_pair(v, 1.0));
+    } else {
+      // float mul = flipped ? -1 : 1;
+      // float mul = (depth_ % 2 == 0) ? -1 : 1;
+      float mul = 1;
+      double step = 1.0 / number_of_points;
+      for (int i = 0; i < number_of_points; i++) {
+        if (step * (i + 1) >= 1) {
+          discretizationCDF.push_back(std::make_pair(
+              NormalTrunkedCDFInverse(1 - std::numeric_limits<float>::epsilon(),
+                                      mul * q_, sigma),
+              step * (i + 1)));
+        } else {
+          discretizationCDF.push_back(std::make_pair(
+              NormalTrunkedCDFInverse(step * (i + 1), mul * q_, sigma),
+              step * (i + 1)));
+        }
+      }
+      originalDiscretizationCDF = discretizationCDF;
+	}
+
+  } else {
+    UpdateNodeCDF();
+  }
+  /*
+  
+  double step = 1.0 / number_of_points;
+  for (int i = 0; i < number_of_points; i++) {
+    if (step * (i + 1) >= 1) {
+      discretizationCDF.push_back(std::make_pair(
+          NormalTrunkedCDFInverse(0.999, q_, sigma), step * (i + 1)));
+    } else {
+      discretizationCDF.push_back(std::make_pair(
+          NormalTrunkedCDFInverse(step * (i + 1),q_, sigma),
+          step * (i + 1)));
+    }
+  }
+  */
   // Increment N.
   n_ += multivisit;
   // Decrement virtual loss.
@@ -339,7 +400,8 @@ V4TrainingData Node::GetV4TrainingData(GameResult game_result,
   // Prevent garbage/invalid training data from being uploaded to server.
   if (total_n <= 0.0f) throw Exception("Search generated invalid data!");
   // Set illegal moves to have -1 probability.
-  std::fill(std::begin(result.probabilities), std::end(result.probabilities), -1);
+  std::fill(std::begin(result.probabilities), std::end(result.probabilities),
+            -1);
   // Set moves probabilities according to their relative amount of visits.
   for (const auto& child : Edges()) {
     result.probabilities[child.edge()->GetMove().as_nn_index()] =
@@ -422,7 +484,8 @@ void NodeTree::TrimTreeAtHead() {
   auto tmp = std::move(current_head_->sibling_);
   // Send dependent nodes for GC instead of destroying them immediately.
   gNodeGc.AddToGcQueue(std::move(current_head_->child_));
-  *current_head_ = Node(current_head_->GetParent(), current_head_->index_);
+  *current_head_ = Node(current_head_->GetParent(), current_head_->index_,
+                        current_head_->depth_);
   current_head_->sibling_ = std::move(tmp);
 }
 
@@ -438,7 +501,7 @@ bool NodeTree::ResetToPosition(const std::string& starting_fen,
   }
 
   if (!gamebegin_node_) {
-    gamebegin_node_ = std::make_unique<Node>(nullptr, 0);
+    gamebegin_node_ = std::make_unique<Node>(nullptr, 0, 0);
   }
 
   history_.Reset(starting_board, no_capture_ply,

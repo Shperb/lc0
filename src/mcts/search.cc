@@ -33,6 +33,7 @@
 #include <iomanip>
 #include <iostream>
 #include <iterator>
+#include <random>
 #include <sstream>
 #include <thread>
 
@@ -102,7 +103,9 @@ void ApplyDirichletNoise(Node* node, float eps, double alpha) {
 }  // namespace
 
 void Search::SendUciInfo() REQUIRES(nodes_mutex_) {
-  auto edges = GetBestChildrenNoTemperature(root_node_, params_.GetMultiPv());
+  // auto edges = GetBestChildrenNoTemperature(root_node_,
+  // params_.GetMultiPv());
+  auto edge = GetBestChildrenExpectation(root_node_);
   const auto score_type = params_.GetScoreType();
 
   std::vector<ThinkingInfo> uci_infos;
@@ -120,32 +123,31 @@ void Search::SendUciInfo() REQUIRES(nodes_mutex_) {
   common_info.tb_hits = tb_hits_.load(std::memory_order_acquire);
 
   int multipv = 0;
+
   const auto default_q = -root_node_->GetQ();
-  for (const auto& edge : edges) {
-    ++multipv;
-    uci_infos.emplace_back(common_info);
-    auto& uci_info = uci_infos.back();
-    if (score_type == "centipawn") {
-      uci_info.score = 295 * edge.GetQ(default_q) /
-                       (1 - 0.976953126 * std::pow(edge.GetQ(default_q), 14));
-    } else if (score_type == "centipawn_2018") {
-      uci_info.score = 290.680623072 * tan(1.548090806 * edge.GetQ(default_q));
-    } else if (score_type == "win_percentage") {
-      uci_info.score = edge.GetQ(default_q) * 5000 + 5000;
-    } else if (score_type == "Q") {
-      uci_info.score = edge.GetQ(default_q) * 10000;
-    }
-    if (params_.GetMultiPv() > 1) uci_info.multipv = multipv;
-    bool flip = played_history_.IsBlackToMove();
-    for (auto iter = edge; iter;
-         iter = GetBestChildNoTemperature(iter.node()), flip = !flip) {
-      uci_info.pv.push_back(iter.GetMove(flip));
-      if (!iter.node()) break;  // Last edge was dangling, cannot continue.
-    }
+  ++multipv;
+  uci_infos.emplace_back(common_info);
+  auto& uci_info = uci_infos.back();
+  if (score_type == "centipawn") {
+    uci_info.score = 295 * edge.GetQ(default_q) /
+                     (1 - 0.976953126 * std::pow(edge.GetQ(default_q), 14));
+  } else if (score_type == "centipawn_2018") {
+    uci_info.score = 290.680623072 * tan(1.548090806 * edge.GetQ(default_q));
+  } else if (score_type == "win_percentage") {
+    uci_info.score = edge.GetQ(default_q) * 5000 + 5000;
+  } else if (score_type == "Q") {
+    uci_info.score = edge.GetQ(default_q) * 10000;
+  }
+  if (params_.GetMultiPv() > 1) uci_info.multipv = multipv;
+  bool flip = played_history_.IsBlackToMove();
+  for (auto iter = edge; iter;
+       iter = GetBestChildrenExpectation(iter.node()), flip = !flip) {
+    uci_info.pv.push_back(iter.GetMove(flip));
+    if (!iter.node()) break;  // Last edge was dangling, cannot continue.
   }
 
   if (!uci_infos.empty()) last_outputted_uci_info_ = uci_infos.front();
-  if (current_best_edge_ && !edges.empty()) {
+  if (current_best_edge_) {
     last_outputted_info_edge_ = current_best_edge_.edge();
   }
 
@@ -515,7 +517,7 @@ void Search::EnsureBestMoveKnown() REQUIRES(nodes_mutex_)
     REQUIRES(counters_mutex_) {
   if (bestmove_is_sent_) return;
   if (!root_node_->HasChildren()) return;
-
+  /*
   float temperature = params_.GetTemperature();
   const int cutoff_move = params_.GetTemperatureCutoffMove();
   const int moves = played_history_.Last().GetGamePly() / 2;
@@ -529,13 +531,15 @@ void Search::EnsureBestMoveKnown() REQUIRES(nodes_mutex_)
                      params_.GetTempDecayMoves();
     }
   }
-
-  final_bestmove_ = temperature
-                        ? GetBestChildWithTemperature(root_node_, temperature)
-                        : GetBestChildNoTemperature(root_node_);
+  */
+  final_bestmove_ = GetBestChildrenExpectation(root_node_,true);
+  // final_bestmove_ = temperature
+  //                      ? GetBestChildWithTemperature(root_node_, temperature)
+  //                      : GetBestChildNoTemperature(root_node_);
 
   if (final_bestmove_.HasNode() && final_bestmove_.node()->HasChildren()) {
-    final_pondermove_ = GetBestChildNoTemperature(final_bestmove_.node());
+    // final_pondermove_ = GetBestChildNoTemperature(final_bestmove_.node());
+    final_pondermove_ = GetBestChildrenExpectation(final_bestmove_.node());
   }
 }
 
@@ -570,6 +574,57 @@ std::vector<EdgeAndNode> Search::GetBestChildrenNoTemperature(Node* parent,
   std::transform(edges.begin(), middle, std::back_inserter(res),
                  [](const El& x) { return std::get<3>(x); });
   return res;
+}
+
+EdgeAndNode Search::GetBestChildrenExpectation(Node* parent,
+                                               bool toPrint) const {
+  MoveList root_limit;
+  if (parent == root_node_) {
+    PopulateRootMoveLimit(&root_limit);
+  }
+  // Best child is selected using the following criteria:
+  // * Largest number of playouts.
+  // * If two nodes have equal number:
+  //   * If that number is 0, the one with larger prior wins.
+  //   * If that number is larger than 0, the one with larger eval wins.
+  using El = std::tuple<uint64_t, float, float, EdgeAndNode>;
+  std::vector<El> edges;
+  EdgeAndNode bestEdge;
+  // int mult = parent->GetDepth() % 2 == 0 ? 1 : -1;
+  int mult = 1;
+  std::ofstream myfile;
+  if (toPrint) {
+    myfile.open("move_CDF_log.txt", std::ios::out | std::ios::app);
+  }
+  float bestValue = std::numeric_limits<float>::lowest();
+  for (auto edge : parent->Edges()) {
+    if (parent == root_node_ && !root_limit.empty() &&
+        std::find(root_limit.begin(), root_limit.end(), edge.GetMove()) ==
+            root_limit.end()) {
+      continue;
+    }
+    if (edge.node() && edge.node()->GetN() > 0 &&
+        edge.node()->discretizationCDF.size() > 0) {
+      float expectation = mult * edge.GetExpectation(parent->GetExpectation());
+      if (expectation > bestValue) {
+        bestValue = expectation;
+        bestEdge = edge;
+      }
+      if (toPrint) {
+        myfile << edge.node()->GetDepth() << "\t" << edge.GetMove().as_string()
+               << "\t"
+               << expectation << "\t [ ";
+        for (auto bucket : edge.node()->discretizationCDF) {
+          myfile << "(" << bucket.first << "," << bucket.second << ") ";
+        }
+        myfile << "]" << std::endl;
+      }
+    }
+  }
+  if (toPrint) {
+    myfile.close();
+  }
+  return bestEdge;
 }
 
 // Returns a child with most visits.
@@ -798,7 +853,11 @@ void SearchWorker::GatherMinibatch() {
     // If there's something to process without touching slow neural net, do it.
     if (minibatch_size > 0 && computation_->GetCacheMisses() == 0) return;
     // Pick next node to extend.
-    minibatch_.emplace_back(PickNodeToExtend(collisions_left));
+    auto node_to_extend = PickNodeToExtend(collisions_left, true);
+    if (node_to_extend.IsRedundent()) {
+      return;
+    }
+    minibatch_.emplace_back(node_to_extend);
     auto& picked_node = minibatch_.back();
     auto* node = picked_node.node;
 
@@ -861,6 +920,363 @@ void IncrementNInFlight(Node* node, Node* root, int amount) {
 }
 }  // namespace
 
+SearchWorker::NodeToProcess SearchWorker::PickNodeToExtend(int collision_limit,
+                                                           bool isFistCall) {
+  // Starting from search_->root_node_, generate a playout, choosing a
+  // node at each level according to the MCTS formula. n_in_flight_ is
+  // incremented for each node in the playout (via TryStartScoreUpdate()).
+
+  Node* node = search_->root_node_;
+  Node::Iterator best_edge;
+  Node::Iterator alpha_edge;
+  Node::Iterator root_unexpended_edge;
+  Node::Iterator second_best_edge;
+  bool all_expanded_under_root = true;
+  bool isAlpha = false;
+  // Precache a newly constructed node to avoid memory allocations being
+  // performed while the mutex is held.
+  if (!precached_node_) {
+    precached_node_ = std::make_unique<Node>(nullptr, 0, node->GetDepth() + 1);
+  }
+  if (isFistCall) {
+    SharedMutex::Lock lock(search_->nodes_mutex_);
+  }
+
+  // Fetch the current best root node visits for possible smart pruning.
+
+  // const int64_t best_node_n = search_->current_best_edge_.GetN();
+
+  // True on first iteration, false as we dive deeper.
+  bool is_root_node = true;
+  bool node_already_updated = true;
+  float alphaValue = std::numeric_limits<float>::lowest();
+  float betaValue = std::numeric_limits<float>::lowest();
+  float v = std::numeric_limits<float>::lowest();
+  float v_prim = std::numeric_limits<float>::lowest();
+
+  while (true) {
+    // First, terminate if we find collisions or leaf nodes.
+    // Set 'node' to point to the node that was picked on previous iteration,
+    // possibly spawning it.
+    // TODO(crem) This statement has to be in the end of the loop rather than
+    //            in the beginning (and there would be no need for "if
+    //            (!is_root_node)"), but that would mean extra mutex lock.
+    //            Will revisit that after rethinking locking strategy.
+    if (!node_already_updated) {
+      node = best_edge.GetOrSpawnNode(/* parent */ node, &precached_node_);
+    }
+    best_edge.Reset();
+    // n_in_flight_ is incremented. If the method returns false, then there is
+    // a search collision, and this node is already being expanded.
+    if (!node->TryStartScoreUpdate()) {
+      if (!is_root_node) {
+        IncrementNInFlight(node->GetParent(), search_->root_node_,
+                           collision_limit - 1);
+      }
+      return NodeToProcess::Collision(node, node->GetDepth(), collision_limit);
+    }
+    // Either terminal or unexamined leaf node -- the end of this playout.
+    if (node->IsTerminal() || !node->HasChildren()) {
+      return NodeToProcess::Visit(node, node->GetDepth());
+    }
+    // Shahaf: not sure if this should be deleted or not
+    Node* possible_shortcut_child = node->GetCachedBestChild();
+    if (possible_shortcut_child) {
+      // Add two here to reverse the conservatism that goes into calculating the
+      // remaining cache visits.
+      collision_limit =
+          std::min(collision_limit, node->GetRemainingCacheVisits() + 2);
+      is_root_node = false;
+      node = possible_shortcut_child;
+      node_already_updated = true;
+      continue;
+    }
+    node_already_updated = false;
+
+    // If we fall through, then n_in_flight_ has been incremented but this
+    // playout remains incomplete; we must go deeper.
+    // const float cpuct = ComputeCpuct(params_, node->GetN());
+    // const float puct_mult =
+    //    cpuct * std::sqrt(std::max(node->GetChildrenVisits(), 1u));
+    float best = std::numeric_limits<float>::lowest();
+    float second_best = std::numeric_limits<float>::lowest();
+    int possible_moves = 0;
+    // const float fpu = GetFpu(params_, node, is_root_node);
+    if (is_root_node) {
+      for (auto child : node->Edges()) {
+        // If there's no chance to catch up to the current best node with
+        // remaining playouts, don't consider it.
+        // best_move_node_ could have changed since best_node_n was retrieved.
+        // To ensure we have at least one node to expand, always include
+        // current best node.
+
+        // if (child != search_->current_best_edge_ &&
+        //    search_->remaining_playouts_ < best_node_n - child.GetN()) {
+        //  continue;
+        //}
+
+        // If root move filter exists, make sure move is in the list.
+        if (!root_move_filter_.empty() &&
+            std::find(root_move_filter_.begin(), root_move_filter_.end(),
+                      child.GetMove()) == root_move_filter_.end()) {
+          continue;
+        }
+
+        const float score = child.GetExpectation(node->GetExpectation());
+        if (score == std::numeric_limits<float>::lowest()) {
+          all_expanded_under_root = false;
+          root_unexpended_edge = child;
+        } else if (score > alphaValue) {
+          alpha_edge = child;
+          betaValue = alphaValue;
+          alphaValue = score;
+        } else if (score > betaValue) {
+          betaValue = score;
+        }
+        ++possible_moves;
+      }
+
+      // const float Q = child.GetQ(fpu);
+      // const float score = child.GetU(puct_mult) + Q;
+      // if (score > best) {
+      //  second_best = best;
+      //  second_best_edge = best_edge;
+      //  best = score;
+      //  best_edge = child;
+      //} else if (score > second_best) {
+      //  second_best = score;
+      //  second_best_edge = child;
+      //}
+      int numberOfChildren = 0;
+      int numberOfChildren2 = 0;
+      float sumProbability = 0;
+      if (!all_expanded_under_root) {
+        best_edge = root_unexpended_edge;
+      } else {
+        for (auto child : node->Edges()) {
+          numberOfChildren++;
+          if (child == alpha_edge) {
+            sumProbability +=
+                child.GetProbabilityLTValue(betaValue, 1) *
+                (betaValue - child.GetExpectationLTValue(betaValue, 1));
+          } else {
+            sumProbability +=
+                child.GetProbabilityGTValue(alphaValue, 1) *
+                (child.GetExpectationGTValue(alphaValue, 1) - alphaValue);
+          }
+        }
+        if (sumProbability == 0) {
+          // printf("error: sumprob = 0\n");
+          // SharedMutex::Lock nodes_lock(search_->nodes_mutex_);
+          Mutex::Lock lock(search_->counters_mutex_);
+          search_->FireStopInternal();
+          if (search_->stop_.load(std::memory_order_acquire) &&
+              search_->ok_to_respond_bestmove_ && !search_->bestmove_is_sent_) {
+            search_->SendUciInfo();
+            search_->EnsureBestMoveKnown();
+            search_->SendMovesStats();
+            search_->best_move_callback_(
+                {search_->final_bestmove_.GetMove(
+                     search_->played_history_.IsBlackToMove()),
+                 search_->final_pondermove_.GetMove(
+                     !search_->played_history_.IsBlackToMove())});
+            search_->bestmove_is_sent_ = true;
+            search_->current_best_edge_ = EdgeAndNode();
+          }
+          // return PickNodeToExtend(collision_limit, isAlpha);
+          return NodeToProcess::Redundent();
+        }
+        double randomNumber = Random::Get().GetFloat(1.0);
+        double accumulator = 0;
+        for (auto child : node->Edges()) {
+          float childValue;
+          if (child == alpha_edge) {
+            childValue =
+                child.GetProbabilityLTValue(betaValue, 1) *
+                (betaValue - child.GetExpectationLTValue(betaValue, 1));
+          } else {
+            childValue =
+                child.GetProbabilityGTValue(alphaValue, 1) *
+                (child.GetExpectationGTValue(alphaValue, 1) - alphaValue);
+          }
+          numberOfChildren2++;
+          accumulator += childValue / sumProbability;
+          if (accumulator > randomNumber) {
+            if (child == alpha_edge) {
+              isAlpha = true;
+            } else {
+              isAlpha = false;
+            }
+            best_edge = child;
+
+            if (!best_edge.edge()) {
+              node->UpdateNodeCDF();
+              return PickNodeToExtend(collision_limit, false);
+            }
+            break;
+          } else if (numberOfChildren2 == numberOfChildren) {
+            node->UpdateNodeCDF();
+            return PickNodeToExtend(collision_limit, false);
+          }
+        }
+      }
+    } else if (!isAlpha) {
+      float sumProbability = 0;
+      int numberOfChildren = 0;
+      int numberOfChildren2 = 0;
+      float nodeExpectationGTAlpha, nodeProbabilityGTAlpha;
+      if (node->GetDepth() % 2 != search_->root_node_->GetDepth() % 2) {
+        nodeProbabilityGTAlpha = node->GetProbabilityGTValue(alphaValue);
+        nodeExpectationGTAlpha = -node->GetExpectationGTValue(alphaValue);
+      } else {
+        nodeProbabilityGTAlpha = node->GetProbabilityLTValue(-alphaValue);
+        nodeExpectationGTAlpha = -node->GetExpectationLTValue(-alphaValue);
+      }
+      for (auto child : node->Edges()) {
+        numberOfChildren++;
+        if (node->GetDepth() % 2 == search_->root_node_->GetDepth() % 2) {
+          sumProbability +=
+              child.GetProbabilityGTValue(alphaValue, nodeProbabilityGTAlpha) *
+              (child.GetExpectationGTValue(alphaValue, nodeExpectationGTAlpha) -
+               alphaValue);
+
+        } else {
+          sumProbability +=
+              child.GetProbabilityLTValue(-alphaValue, nodeProbabilityGTAlpha) *
+              (-alphaValue - child.GetExpectationLTValue(
+                                 -alphaValue, nodeExpectationGTAlpha));
+        }
+      }
+      if (sumProbability == 0) {
+        // printf("error: sumprob = 0\n");
+        node->UpdateNodeCDF();
+        return PickNodeToExtend(collision_limit, false);
+      }
+      double randomNumber = Random::Get().GetFloat(1.0);
+      double accumulator = 0;
+      for (auto child : node->Edges()) {
+        numberOfChildren2++;
+        float childValue;
+
+        if (node->GetDepth() % 2 == search_->root_node_->GetDepth() % 2) {
+          childValue =
+              child.GetProbabilityGTValue(alphaValue, nodeProbabilityGTAlpha) *
+              (child.GetExpectationGTValue(alphaValue, nodeExpectationGTAlpha) -
+               alphaValue);
+
+        } else {
+          childValue =
+              child.GetProbabilityLTValue(-alphaValue, nodeProbabilityGTAlpha) *
+              (-alphaValue - child.GetExpectationLTValue(
+                                 -alphaValue, nodeExpectationGTAlpha));
+        }
+        accumulator += childValue / sumProbability;
+        if (accumulator > randomNumber) {
+          best_edge = child;
+          if (!best_edge.edge()) {
+            node->UpdateNodeCDF();
+            return PickNodeToExtend(collision_limit, false);
+          }
+          break;
+        } else if (numberOfChildren2 == numberOfChildren) {
+          node->UpdateNodeCDF();
+          return PickNodeToExtend(collision_limit, false);
+        }
+      }
+    } else {
+      float sumProbability = 0;
+      int numberOfChildren = 0;
+      int numberOfChildren2 = 0;
+      float nodeExpectationLTBeta, nodeProbabilityLTBeta;
+      if (node->GetDepth() % 2 != search_->root_node_->GetDepth() % 2) {
+        nodeProbabilityLTBeta = node->GetProbabilityLTValue(betaValue);
+        nodeExpectationLTBeta = -node->GetExpectationLTValue(betaValue);
+      } else {
+        nodeProbabilityLTBeta = node->GetProbabilityGTValue(-betaValue);
+        nodeExpectationLTBeta = -node->GetExpectationGTValue(-betaValue);
+      }
+
+      for (auto child : node->Edges()) {
+        numberOfChildren++;
+        if (node->GetDepth() % 2 == search_->root_node_->GetDepth() % 2) {
+          sumProbability +=
+              child.GetProbabilityLTValue(betaValue, nodeProbabilityLTBeta) *
+              (betaValue -
+               child.GetExpectationLTValue(betaValue, nodeExpectationLTBeta));
+        } else {
+          sumProbability +=
+              child.GetProbabilityGTValue(-betaValue, nodeProbabilityLTBeta) *
+              (child.GetExpectationGTValue(-betaValue, nodeExpectationLTBeta) +
+               betaValue);
+        }
+      }
+      if (sumProbability == 0) {
+        // printf("error: sumprob = 0\n");
+        node->UpdateNodeCDF();
+        return PickNodeToExtend(collision_limit, false);
+      }
+      double randomNumber = Random::Get().GetFloat(1.0);
+      double accumulator = 0;
+      for (auto child : node->Edges()) {
+        if (child == alpha_edge) {
+          continue;
+        }
+        float childValue;
+        numberOfChildren2++;
+        if (node->GetDepth() % 2 == search_->root_node_->GetDepth() % 2) {
+          childValue =
+              child.GetProbabilityLTValue(betaValue, nodeProbabilityLTBeta) *
+              (betaValue -
+               child.GetExpectationLTValue(betaValue, nodeExpectationLTBeta));
+
+        } else {
+          childValue =
+              child.GetProbabilityGTValue(-betaValue, nodeProbabilityLTBeta) *
+              (child.GetExpectationGTValue(-betaValue, nodeExpectationLTBeta) +
+               betaValue);
+        }
+        accumulator += childValue / sumProbability;
+        if (accumulator > randomNumber) {
+          best_edge = child;
+          if (!best_edge.edge()) {
+            node->UpdateNodeCDF();
+            return PickNodeToExtend(collision_limit, false);
+          }
+          break;
+        } else if (numberOfChildren2 == numberOfChildren) {
+          node->UpdateNodeCDF();
+          return PickNodeToExtend(collision_limit, false);
+        }
+      }
+    }
+
+    // if (second_best_edge) {
+    //  int estimated_visits_to_change_best =
+    //      best_edge.GetVisitsToReachU(second_best, puct_mult, fpu);
+    //  // Only cache for n-2 steps as the estimate created by
+    //  GetVisitsToReachU
+    //  // has potential rounding errors and some conservative logic that can
+    //  push
+    //  // it up to 2 away from the real value.
+    //  node->UpdateBestChild(best_edge,
+    //                        std::max(0, estimated_visits_to_change_best -
+    //                        2));
+    //  collision_limit =
+    //      std::min(collision_limit, estimated_visits_to_change_best);
+    //  assert(collision_limit >= 1);
+    //  second_best_edge.Reset();
+    //}
+
+    if (is_root_node && possible_moves <= 1 && !search_->limits_.infinite) {
+      // If there is only one move theoretically possible within remaining
+      // time, output it.
+      Mutex::Lock counters_lock(search_->counters_mutex_);
+      search_->only_one_possible_move_left_ = true;
+    }
+    is_root_node = false;
+  }
+}
+
 // Returns node and whether there's been a search collision on the node.
 SearchWorker::NodeToProcess SearchWorker::PickNodeToExtend(
     int collision_limit) {
@@ -875,7 +1291,7 @@ SearchWorker::NodeToProcess SearchWorker::PickNodeToExtend(
   // Precache a newly constructed node to avoid memory allocations being
   // performed while the mutex is held.
   if (!precached_node_) {
-    precached_node_ = std::make_unique<Node>(nullptr, 0);
+    precached_node_ = std::make_unique<Node>(nullptr, 0, node->GetDepth() + 1);
   }
 
   SharedMutex::Lock lock(search_->nodes_mutex_);
@@ -914,6 +1330,7 @@ SearchWorker::NodeToProcess SearchWorker::PickNodeToExtend(
     if (node->IsTerminal() || !node->HasChildren()) {
       return NodeToProcess::Visit(node, depth);
     }
+    // Shahaf: not sure if this should be deleted or not
     Node* possible_shortcut_child = node->GetCachedBestChild();
     if (possible_shortcut_child) {
       // Add two here to reverse the conservatism that goes into calculating the
@@ -943,10 +1360,12 @@ SearchWorker::NodeToProcess SearchWorker::PickNodeToExtend(
         // best_move_node_ could have changed since best_node_n was retrieved.
         // To ensure we have at least one node to expand, always include
         // current best node.
+
         if (child != search_->current_best_edge_ &&
             search_->remaining_playouts_ < best_node_n - child.GetN()) {
           continue;
         }
+
         // If root move filter exists, make sure move is in the list.
         if (!root_move_filter_.empty() &&
             std::find(root_move_filter_.begin(), root_move_filter_.end(),
@@ -1298,6 +1717,7 @@ void SearchWorker::DoBackupUpdateSingleNode(
   // Backup V value up to a root. After 1 visit, V = Q.
   float v = node_to_process.v;
   float d = node_to_process.d;
+  bool flipped = false;
   for (Node *n = node, *p; n != search_->root_node_->GetParent(); n = p) {
     p = n->GetParent();
 
@@ -1307,7 +1727,7 @@ void SearchWorker::DoBackupUpdateSingleNode(
       v = n->GetQ();
       d = n->GetD();
     }
-    n->FinalizeScoreUpdate(v, d, node_to_process.multivisit);
+    n->FinalizeScoreUpdate(v, d, node_to_process.multivisit, flipped);
 
     // Nothing left to do without ancestors to update.
     if (!p) break;
@@ -1316,29 +1736,40 @@ void SearchWorker::DoBackupUpdateSingleNode(
     can_convert = can_convert && p != search_->root_node_ && !p->IsTerminal();
 
     // A non-winning terminal move needs all other moves to have the same value.
+    float draw_or_lost = std::numeric_limits<float>::lowest();
     if (can_convert && v != 1.0f) {
       for (const auto& edge : p->Edges()) {
-        can_convert = can_convert && edge.IsTerminal() && edge.GetQ(0.0f) == v;
+        // can_convert = can_convert && edge.IsTerminal() && edge.GetQ(0.0f) ==
+        // v;
+        can_convert = can_convert && edge.IsTerminal();
+        draw_or_lost = std::max(draw_or_lost, edge.GetQ(0.0f));
       }
     }
 
     // Convert the parent to a terminal loss if at least one move is winning or
     // to a terminal win or draw if all moves are loss or draw respectively.
     if (can_convert) {
+      // p->MakeTerminal(v == 1.0f ? GameResult::BLACK_WON
+      //                          : v == -1.0f ? GameResult::WHITE_WON
+      //                                       : GameResult::DRAW);
       p->MakeTerminal(v == 1.0f ? GameResult::BLACK_WON
-                                : v == -1.0f ? GameResult::WHITE_WON
-                                             : GameResult::DRAW);
+                                : draw_or_lost == -1.0f ? GameResult::WHITE_WON
+                                                        : GameResult::DRAW);
     }
 
     // Q will be flipped for opponent.
     v = -v;
-
+    flipped = !flipped;
     // Update the stats.
     // Best move.
-    if (p == search_->root_node_ &&
-        search_->current_best_edge_.GetN() <= n->GetN()) {
+    // if (p == search_->root_node_ &&
+    //    search_->current_best_edge_.GetN() <= n->GetN()) {
+    //  search_->current_best_edge_ =
+    //      search_->GetBestChildNoTemperature(search_->root_node_);
+    //}
+    if (p == search_->root_node_) {
       search_->current_best_edge_ =
-          search_->GetBestChildNoTemperature(search_->root_node_);
+          search_->GetBestChildrenExpectation(search_->root_node_);
     }
   }
   search_->total_playouts_ += node_to_process.multivisit;

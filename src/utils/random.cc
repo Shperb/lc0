@@ -30,7 +30,8 @@
 
 namespace lczero {
 
-Random::Random() : gen_(std::random_device()()) {}
+//Random::Random() : gen_(std::random_device()()) {}
+Random::Random() : gen_(1564894) {}
 
 Random& Random::Get() {
   static Random rand;

@@ -29,16 +29,20 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iomanip>
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <sstream>
+#include <stdexcept>
+#include <utility>
+#include <vector>
 #include "chess/board.h"
 #include "chess/callbacks.h"
 #include "chess/position.h"
 #include "neural/encoder.h"
 #include "neural/writer.h"
 #include "utils/mutex.h"
-
 namespace lczero {
 
 // Children of a node are stored the following way:
@@ -129,7 +133,16 @@ class Node {
   using ConstIterator = Edge_Iterator<true>;
 
   // Takes pointer to a parent node and own index in a parent.
-  Node(Node* parent, uint16_t index) : parent_(parent), index_(index) {}
+  Node(Node* parent, uint16_t index, unsigned int depth)
+      : parent_(parent),
+        index_(index),
+        depth_(depth)
+        //,sigma(0.3 + (depth > 20 ? 0.5 : depth / 10 * (depth % 10)*0.02)) 
+  {
+    if (parent) {
+      discretizationCDF = parent_->discretizationCDF;
+    }
+  }
 
   // Allocates a new edge and a new node. The node has to be no edges before
   // that.
@@ -140,6 +153,8 @@ class Node {
 
   // Gets parent node.
   Node* GetParent() const { return parent_; }
+
+  unsigned int GetDepth() const { return depth_; }
 
   // Returns whether a node has children.
   bool HasChildren() const { return edges_; }
@@ -156,6 +171,260 @@ class Node {
   float GetQ() const { return q_; }
   float GetD() const { return d_; }
 
+  float GetExpectationBetweenRange(
+      std::vector<std::pair<float, float>>::const_iterator first,
+      std::vector<std::pair<float, float>>::const_iterator last) const {
+    float sum = 0;
+    float prev = 0;
+    float total = 0;
+    for (auto t = first; t != last; ++t) {
+      sum += (*t).first * ((*t).second - prev);
+      total += ((*t).second - prev);
+      prev = (*t).second;
+    }
+    if (total > 0) {
+      return sum / total;
+    } else {
+      return std::numeric_limits<float>::lowest();
+    }
+  }
+
+  float GetExpectation() const {
+    return GetExpectationBetweenRange(discretizationCDF.begin(),
+                                      discretizationCDF.end());
+  }
+
+  float GetProbabilityGTValue(float val) const {
+    auto compare = [](const std::pair<float, float>& lhs,
+                      const std::pair<float, float>& rhs) -> bool {
+      return (lhs.first < rhs.first);
+    };
+    auto it = std::upper_bound(
+        discretizationCDF.begin(), discretizationCDF.end(),
+        std::make_pair(val, std::numeric_limits<float>::max()), compare);
+    if (it == discretizationCDF.begin()) {
+      return 1.0;
+    } else if (it == discretizationCDF.end()) {
+      return 0.0;
+    } else {
+      it--;
+      return 1.0 - (*it).second;
+    }
+  }
+  /*
+  long DiscretizationCDFBound(float val, bool (*comp)(float, float)) {
+    long low = 0, high = discretizationCDF.size() - 1, mid, ans;
+    if (comp(discretizationCDF[low].first,val)) {
+      return -1;
+    }
+    while (low <= high) {
+      mid = (low + high) / 2;
+      if (comp(discretizationCDF[mid].first,val)) {
+        ans = mid;
+        high = mid - 1;
+      } else {
+        low = mid + 1;
+      }
+    }
+    return ans;
+  }
+  */
+  float GetProbabilityLTValue(float val) const {
+    auto compare = [](const std::pair<float, float>& lhs,
+                      const std::pair<float, float>& rhs) -> bool {
+      return (lhs.first < rhs.first);
+    };
+    auto it = std::lower_bound(
+        discretizationCDF.begin(), discretizationCDF.end(),
+        std::make_pair(val, std::numeric_limits<float>::min()), compare);
+    if (it == discretizationCDF.begin()) {
+      return 0.0;
+    } else if (it == discretizationCDF.end()) {
+      return 1.0;
+    } else {
+      it--;
+      return (*it).second;
+    }
+  }
+
+  void UpdateNodeCDF();
+
+  /*
+  void addCDF(std::vector<std::pair<float, float>> newChildCDF) {
+    std::function<float(float)> maybe_reverse;
+    if (depth_ % 2 == 0) {
+      maybe_reverse = [](float prob) -> float { return 1 - prob; };
+    } else {
+      maybe_reverse = [](float prob) -> float { return prob; };
+    }
+    int new_index, curr_index;
+    new_index = curr_index = 0;
+    float new_prob, curr_prob;
+    new_prob, curr_prob = maybe_reverse(0);
+    bool to_continue = true;
+    std::vector<std::pair<float, float>> updatedCDF;
+    while (new_index < newChildCDF.size() &&
+           curr_index < discretizationCDF.size() && to_continue) {
+      float prob_to_add;
+      if (discretizationCDF[curr_index].first < newChildCDF[new_index].first) {
+        curr_prob = maybe_reverse(discretizationCDF[curr_index].second);
+        prob_to_add = maybe_reverse(curr_prob * new_prob);
+        if (prob_to_add > 0) {
+          updatedCDF.push_back(
+              std::make_pair(discretizationCDF[curr_index].first, prob_to_add));
+        }
+        curr_index++;
+      } else if (discretizationCDF[curr_index].first >
+                 newChildCDF[new_index].first) {
+        new_prob = maybe_reverse(newChildCDF[new_index].second);
+        prob_to_add = maybe_reverse(curr_prob * new_prob);
+        if (prob_to_add > 0) {
+          updatedCDF.push_back(
+              std::make_pair(newChildCDF[new_index].first, prob_to_add));
+        }
+        new_index++;
+      } else {
+        new_prob = maybe_reverse(newChildCDF[new_index].second);
+        curr_prob = maybe_reverse(discretizationCDF[curr_index].second);
+        prob_to_add = maybe_reverse(curr_prob * new_prob);
+        updatedCDF.push_back(
+            std::make_pair(newChildCDF[new_index].first, prob_to_add));
+        new_index++;
+        curr_index++;
+      }
+      if (prob_to_add == 1) {
+        to_continue = false;
+      }
+    }
+    while (curr_index < discretizationCDF.size() && to_continue) {
+      updatedCDF.push_back(
+          std::make_pair(discretizationCDF[curr_index].first,
+                         discretizationCDF[curr_index].second));
+      curr_index++;
+    }
+
+    while (new_index < newChildCDF.size() && to_continue) {
+      updatedCDF.push_back(std::make_pair(newChildCDF[new_index].first,
+                                          newChildCDF[new_index].second));
+      new_index++;
+    }
+    trimCDF(updatedCDF, number_of_points);
+    discretizationCDF = updatedCDF;
+  }
+  */
+  void addCDF(std::vector<std::pair<float, float>> CDFtoAdd, bool toReverse) {
+    std::vector<std::pair<float, float>> maybeReversedCDF;
+    if (!toReverse) {
+      maybeReversedCDF = CDFtoAdd;
+    } else {
+      float prev = 0;
+      for (auto pair : CDFtoAdd) {
+        maybeReversedCDF.insert(
+            maybeReversedCDF.begin(),
+            std::make_pair(pair.first * -1, 1.0 - prev));
+        prev = pair.second;
+      }
+    }
+    std::function<float(float)> maybe_reverse;
+    //if (depth_ % 2 == 0) {
+    maybe_reverse = [](float prob) -> float { return 1 - prob; };
+    //} else {
+    //  maybe_reverse = [](float prob) -> float { return prob; };
+    //}
+    int new_index, curr_index;
+    new_index = curr_index = 0;
+    float new_prob, curr_prob;
+    new_prob =  curr_prob = maybe_reverse(0);
+    bool to_continue = true;
+    std::vector<std::pair<float, float>> updatedCDF;
+    while (new_index < maybeReversedCDF.size() &&
+           curr_index < discretizationCDF.size() && to_continue) {
+      float prob_to_add;
+      if (discretizationCDF[curr_index].first <
+          maybeReversedCDF[new_index].first) {
+        curr_prob = maybe_reverse(discretizationCDF[curr_index].second);
+        prob_to_add = maybe_reverse(curr_prob * new_prob);
+        if (prob_to_add > 0) {
+          updatedCDF.push_back(
+              std::make_pair(discretizationCDF[curr_index].first, prob_to_add));
+        }
+        curr_index++;
+      } else if (discretizationCDF[curr_index].first >
+                 maybeReversedCDF[new_index].first) {
+        new_prob = maybe_reverse(maybeReversedCDF[new_index].second);
+        prob_to_add = maybe_reverse(curr_prob * new_prob);
+        if (prob_to_add > 0) {
+          updatedCDF.push_back(
+              std::make_pair(maybeReversedCDF[new_index].first, prob_to_add));
+        }
+        new_index++;
+      } else {
+        new_prob = maybe_reverse(maybeReversedCDF[new_index].second);
+        curr_prob = maybe_reverse(discretizationCDF[curr_index].second);
+        prob_to_add = maybe_reverse(curr_prob * new_prob);
+        updatedCDF.push_back(
+            std::make_pair(maybeReversedCDF[new_index].first, prob_to_add));
+        new_index++;
+        curr_index++;
+      }
+      if (prob_to_add == 1) {
+        to_continue = false;
+      }
+    }
+    while (curr_index < discretizationCDF.size() && to_continue) {
+      updatedCDF.push_back(
+          std::make_pair(discretizationCDF[curr_index].first,
+                         discretizationCDF[curr_index].second));
+      curr_index++;
+    }
+
+    while (new_index < maybeReversedCDF.size() && to_continue) {
+      updatedCDF.push_back(std::make_pair(maybeReversedCDF[new_index].first,
+                                          maybeReversedCDF[new_index].second));
+      new_index++;
+    }
+    trimCDF(updatedCDF, number_of_points);
+    discretizationCDF = updatedCDF;
+  }
+
+  void trimCDF(std::vector<std::pair<float, float>>& CDF, int points) {
+    int index = 0;
+    float cum_prob = 0;
+    float minValue = CDF[0].first;
+    float maxValue = CDF[CDF.size() - 1].first;
+    while (CDF.size() > points) {
+      if (CDF[index + 1].first - CDF[index].first <
+          (maxValue - minValue) / points) {
+        CDF[index].second = CDF[index + 1].second;
+        CDF.erase(CDF.begin() + index + 1);
+      } else {
+        index++;
+      }
+    }
+  }
+
+  float GetExpectationGTValue(float val) const {
+    auto compare = [](const std::pair<float, float>& lhs,
+                      const std::pair<float, float>& rhs) -> bool {
+      return (lhs.first < rhs.first);
+    };
+    return GetExpectationBetweenRange(
+        std::upper_bound(discretizationCDF.begin(), discretizationCDF.end(),
+                         std::make_pair(val, std::numeric_limits<float>::max()),
+                         compare),
+        discretizationCDF.end());
+  }
+
+  float GetExpectationLTValue(float val) const {
+    auto compare = [](const std::pair<float, float>& lhs,
+                      const std::pair<float, float>& rhs) -> bool {
+      return (lhs.first < rhs.first);
+    };
+    auto it = std::lower_bound(
+        discretizationCDF.begin(), discretizationCDF.end(),
+        std::make_pair(val, std::numeric_limits<float>::min()), compare);
+    return GetExpectationBetweenRange(discretizationCDF.begin(), it);
+  }
   // Returns whether the node is known to be draw/lose/win.
   bool IsTerminal() const { return is_terminal_; }
   uint16_t GetNumEdges() const { return edges_.size(); }
@@ -177,7 +446,7 @@ class Node {
   // * Q (weighted average of all V in a subtree)
   // * N (+=1)
   // * N-in-flight (-=1)
-  void FinalizeScoreUpdate(float v, float d, int multivisit);
+  void FinalizeScoreUpdate(float v, float d, int multivisit, bool flipped);
   // When search decides to treat one visit as several (in case of collisions
   // or visiting terminal nodes several times), it amplifies the visit by
   // incrementing n_in_flight.
@@ -236,12 +505,83 @@ class Node {
   // Debug information about the node.
   std::string DebugString() const;
 
+  std::vector<std::pair<float, float>> discretizationCDF;
+  std::vector<std::pair<float, float>> originalDiscretizationCDF;
+
+  double NormalTrunkedCDFInverse(double p, double mu, double sigma) {
+    double a = -1;
+    double b = 1;
+    double sigma_sqr = sigma * sigma;
+    double CDF_a = NonStadartPhi(a, mu, sigma_sqr);
+    double CDF_b = NonStadartPhi(b, mu, sigma_sqr);
+    return NonStandartNormalCDFInverse(CDF_a + p * (CDF_b - CDF_a), mu,
+                                       sigma_sqr);
+  }
+
  private:
   // Performs construction time type initialization. For use only with a node
   // that has not been used beyond its construction.
-  void Reinit(Node* parent, uint16_t index) {
+  void Reinit(Node* parent, uint16_t index, unsigned int depth) {
     parent_ = parent;
     index_ = index;
+    depth_ = depth;
+  }
+
+  double RationalApproximation(double t) {
+    // Abramowitz and Stegun formula 26.2.23.
+    // The absolute value of the error should be less than 4.5 e-4.
+    double c[] = {2.515517, 0.802853, 0.010328};
+    double d[] = {1.432788, 0.189269, 0.001308};
+    return t - ((c[2] * t + c[1]) * t + c[0]) /
+                   (((d[2] * t + d[1]) * t + d[0]) * t + 1.0);
+  }
+
+  double NormalCDFInverse(double p) {
+    if (p <= 0.0 || p >= 1.0) {
+      std::stringstream os;
+      os << "Invalid input argument (" << p
+         << "); must be larger than 0 but less than 1.";
+      throw std::invalid_argument(os.str());
+    }
+
+    // See article above for explanation of this section.
+    if (p < 0.5) {
+      // F^-1(p) = - G^-1(p)
+      return -RationalApproximation(sqrt(-2.0 * log(p)));
+    } else {
+      // F^-1(p) = G^-1(1-p)
+      return RationalApproximation(sqrt(-2.0 * log(1 - p)));
+    }
+  }
+
+  double phi(double x) {
+    // constants
+    double a1 = 0.254829592;
+    double a2 = -0.284496736;
+    double a3 = 1.421413741;
+    double a4 = -1.453152027;
+    double a5 = 1.061405429;
+    double p = 0.3275911;
+
+    // Save the sign of x
+    int sign = 1;
+    if (x < 0) sign = -1;
+    x = fabs(x) / sqrt(2.0);
+
+    // A&S formula 7.1.26
+    double t = 1.0 / (1.0 + p * x);
+    double y = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t *
+                         exp(-x * x);
+
+    return 0.5 * (1.0 + sign * y);
+  }
+
+  double NonStadartPhi(double x, double mu, double sigma) {
+    return phi((x - mu) / sigma);
+  }
+
+  double NonStandartNormalCDFInverse(double p, double mu, double sigma) {
+    return NormalCDFInverse(p) * sigma + mu;
   }
 
   // To minimize the number of padding bytes and to avoid having unnecessary
@@ -287,7 +627,10 @@ class Node {
   // 2 byte fields.
   // Index of this node is parent's edge list.
   uint16_t index_;
-
+  unsigned int depth_;
+  int number_of_points = 35;
+  double sigma = 0.3;
+  //double sigma;
   // 1 byte fields.
   // Whether or not this node end game (with a winning of either sides or draw).
   bool is_terminal_ = false;
@@ -309,18 +652,19 @@ class Node {
 #endif
 
 // A basic sanity check. This must be adjusted when Node members are adjusted.
-#if defined(__i386__) || (defined(__arm__) && !defined(__aarch64__))
-static_assert(sizeof(Node) == 52, "Unexpected size of Node for 32bit compile");
-#else
-static_assert(sizeof(Node) == 80, "Unexpected size of Node");
-#endif
+//#if defined(__i386__) || (defined(__arm__) && !defined(__aarch64__))
+// static_assert(sizeof(Node) == 52, "Unexpected size of Node for 32bit
+// compile"); #else static_assert(sizeof(Node) == 80, "Unexpected size of
+// Node");
+//#endif
 
 // Contains Edge and Node pair and set of proxy functions to simplify access
 // to them.
 class EdgeAndNode {
  public:
   EdgeAndNode() = default;
-  EdgeAndNode(Edge* edge, Node* node) : edge_(edge), node_(node) {}
+  EdgeAndNode(Edge* edge, Node* node, unsigned int depth)
+      : edge_(edge), node_(node), depth_(depth) {}
   void Reset() { edge_ = nullptr; }
   explicit operator bool() const { return edge_ != nullptr; }
   bool operator==(const EdgeAndNode& other) const {
@@ -339,6 +683,31 @@ class EdgeAndNode {
   float GetQ(float default_q) const {
     return (node_ && node_->GetN() > 0) ? node_->GetQ() : default_q;
   }
+
+  float GetExpectation(float default_val) const {
+    return (node_ && node_->GetN() > 0) ? node_->GetExpectation() : default_val;
+  }
+
+  float GetExpectationGTValue(float val, float default_val) const {
+    return (node_ && node_->GetN() > 0) ? node_->GetExpectationGTValue(val)
+                                        : default_val;
+  }
+  float GetExpectationLTValue(float val, float default_val) const {
+    return (node_ && node_->GetN() > 0) ? node_->GetExpectationLTValue(val)
+                                        : default_val;
+  }
+
+  float GetProbabilityGTValue(float val, float default_val) const {
+    return (node_ && node_->GetN() > 0) ? node_->GetProbabilityGTValue(val)
+                                        : default_val;
+  }
+  float GetProbabilityLTValue(float val, float default_val) const {
+    return (node_ && node_->GetN() > 0) ? node_->GetProbabilityLTValue(val)
+                                        : default_val;
+  }
+
+  unsigned int GetDepth() const { return depth_; }
+
   float GetD() const {
     return (node_ && node_->GetN() > 0) ? node_->GetD() : 0.0f;
   }
@@ -379,6 +748,7 @@ class EdgeAndNode {
   // nullptr means that the whole pair is "null". (E.g. when search for a node
   // didn't find anything, or as end iterator signal).
   Edge* edge_ = nullptr;
+  unsigned int depth_;
   // nullptr means that the edge doesn't yet have node extended.
   Node* node_ = nullptr;
 };
@@ -407,8 +777,9 @@ class Edge_Iterator : public EdgeAndNode {
   Edge_Iterator() {}
 
   // Creates "begin()" iterator. Also happens to be a range constructor.
-  Edge_Iterator(const EdgeList& edges, Ptr node_ptr)
-      : EdgeAndNode(edges.size() ? edges.get() : nullptr, nullptr),
+
+  Edge_Iterator(const EdgeList& edges, Ptr node_ptr, unsigned int depth)
+      : EdgeAndNode(edges.size() ? edges.get() : nullptr, nullptr, depth),
         node_ptr_(node_ptr),
         total_count_(edges.size()) {
     if (edge_) Actualize();
@@ -450,10 +821,11 @@ class Edge_Iterator : public EdgeAndNode {
     //    node_ptr_ -> &Node(idx_.3).sibling_  ->  Node(idx_.5)
     //    tmp -> Node(idx_.7)
     if (node_source && *node_source) {
-      (*node_source)->Reinit(parent, current_idx_);
+      (*node_source)->Reinit(parent, current_idx_, parent->depth_ + 1);
       *node_ptr_ = std::move(*node_source);
     } else {
-      *node_ptr_ = std::make_unique<Node>(parent, current_idx_);
+      *node_ptr_ =
+          std::make_unique<Node>(parent, current_idx_, parent->depth_ + 1);
     }
     // 3. Attach stored pointer back to a list:
     //    node_ptr_ ->
